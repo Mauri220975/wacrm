@@ -55,6 +55,30 @@ docker build \
 docker run -d --env-file .env.local -e PORT=3000 -p 3000:3000 wacrm
 ```
 
+## Easypanel
+
+1. Create an **App** service and point its source at this repo
+   (GitHub or Git URL). Under **Build**, choose **Dockerfile**
+   (path `Dockerfile`).
+2. Under **Environment**, paste the variables from
+   `.env.local.example` (at least `NEXT_PUBLIC_SUPABASE_URL`,
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`,
+   `ENCRYPTION_KEY`, `META_APP_SECRET`, plus `NEXT_PUBLIC_SITE_URL`
+   set to your public `https://` domain). Easypanel passes them both
+   as build args (so the `NEXT_PUBLIC_*` values get inlined) and as
+   runtime env. Don't set `PORT`.
+3. Under **Domains**, add your domain with HTTPS and set the proxy
+   port to **3000**.
+4. Deploy. The build fails early with a clear error if the Supabase
+   `NEXT_PUBLIC_*` variables are missing. Changing any
+   `NEXT_PUBLIC_*` value requires a redeploy (rebuild), not just a
+   restart.
+5. Set the Meta webhook URL to
+   `https://<your-domain>/api/whatsapp/webhook`, and if you use Wait
+   steps or flows, add a cron (Easypanel cron service or any external
+   pinger) hitting `/api/automations/cron` and `/api/flows/cron` with
+   the `x-cron-secret` header.
+
 ## Notes
 
 - Database migrations under `supabase/` are **not** run by the
