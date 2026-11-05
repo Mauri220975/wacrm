@@ -74,10 +74,16 @@ docker run -d --env-file .env.local -e PORT=3000 -p 3000:3000 wacrm
    `NEXT_PUBLIC_*` value requires a redeploy (rebuild), not just a
    restart.
 5. Set the Meta webhook URL to
-   `https://<your-domain>/api/whatsapp/webhook`, and if you use Wait
-   steps or flows, add a cron (Easypanel cron service or any external
-   pinger) hitting `/api/automations/cron` and `/api/flows/cron` with
-   the `x-cron-secret` header.
+   `https://<your-domain>/api/whatsapp/webhook`.
+6. If you use Wait steps or flows, add the scheduler: set
+   `AUTOMATION_CRON_SECRET` on the app service and redeploy, then
+   create a second **App** service from the same repo with
+   **Build → Dockerfile**, build path `cron/`, and env vars
+   `APP_URL=https://<your-domain>` and the same
+   `AUTOMATION_CRON_SECRET`. It needs no domain or port. Its logs
+   show one line per call; `200` means it's working, `503` means the
+   app is missing the secret, `401` means the two values differ.
+   Set `CRON_INTERVAL_SECONDS` to change the default 300 s interval.
 
 ## Notes
 
