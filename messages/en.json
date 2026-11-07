@@ -1239,7 +1239,7 @@
       },
       "tags": {
         "select": "Select a tag…",
-        "placeholder": "Tag id",
+        "none": "No tags yet. Create them first in Settings → Fields & tags.",
         "unknown": "{id} (unknown tag)"
       },
       "fields": {
@@ -1316,7 +1316,6 @@
         "placeholderTime": "HH:mm-HH:mm",
         "timezoneLabel": "Time zone",
         "placeholderContact": "name / email / company",
-        "placeholderTag": "tag id",
         "urlLabel": "URL",
         "headersLabel": "Headers",
         "placeholderHeaders": "{\"Authorization\": \"Bearer ...\"}",
@@ -1715,6 +1714,12 @@
       "deleteConfirm": "Delete the tag \"{name}\"? This removes it from all contacts and cannot be undone.",
       "cancel": "Cancel",
       "deleting": "Deleting...",
+      "editAria": "Edit {name}",
+      "editTag": "Edit tag",
+      "save": "Save",
+      "saving": "Saving...",
+      "tagUpdated": "Tag updated",
+      "failedToUpdateTag": "Failed to update tag",
       "colors": {
         "red": "Red",
         "orange": "Orange",

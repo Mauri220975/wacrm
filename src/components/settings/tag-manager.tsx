@@ -40,8 +40,13 @@ const PRESET_COLORS = [
 
 /**
  * Tags card — colour-coded contact labels. Creation is an inline row
- * (name + colour swatch + Add); deletion goes through a confirmation
- * dialog since it detaches the tag from every contact.
+ * (name + colour swatch + Add); clicking a tag opens an edit dialog for
+ * its name and colour; deletion goes through a confirmation dialog since
+ * it detaches the tag from every contact.
+ *
+ * Editing updates the row in place, so the tag keeps its id and every
+ * automation trigger, step and condition that references it keeps working
+ * — unlike deleting and re-creating it.
  */
 export function TagManager() {
   const t = useTranslations('Settings.tagsAndFields');
@@ -56,6 +61,10 @@ export function TagManager() {
   const [deleting, setDeleting] = useState(false);
   const [newTagName, setNewTagName] = useState('');
   const [selectedColor, setSelectedColor] = useState(PRESET_COLORS[3].value);
+  const [tagToEdit, setTagToEdit] = useState<Tag | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editColor, setEditColor] = useState(PRESET_COLORS[3].value);
+  const [updating, setUpdating] = useState(false);
 
   useEffect(() => {
     if (authLoading) return;
@@ -112,6 +121,44 @@ export function TagManager() {
       toast.error(t('failedToCreateTag'));
     } finally {
       setSaving(false);
+    }
+  }
+
+  function openEdit(tag: Tag) {
+    setTagToEdit(tag);
+    setEditName(tag.name);
+    setEditColor(tag.color);
+  }
+
+  async function handleUpdate() {
+    if (!tagToEdit) return;
+    const name = editName.trim();
+    if (!name) {
+      toast.error(t('nameRequired'));
+      return;
+    }
+
+    try {
+      setUpdating(true);
+      const { error } = await supabase
+        .from('tags')
+        .update({ name, color: editColor })
+        .eq('id', tagToEdit.id);
+
+      if (error) throw error;
+
+      toast.success(t('tagUpdated'));
+      setTags((prev) =>
+        prev.map((tg) =>
+          tg.id === tagToEdit.id ? { ...tg, name, color: editColor } : tg,
+        ),
+      );
+      setTagToEdit(null);
+    } catch (err) {
+      console.error('Update error:', err);
+      toast.error(t('failedToUpdateTag'));
+    } finally {
+      setUpdating(false);
     }
   }
 
@@ -174,11 +221,18 @@ export function TagManager() {
                       border: `1px solid ${tag.color}40`,
                     }}
                   >
-                    <span
-                      className="size-2 rounded-full"
-                      style={{ backgroundColor: tag.color }}
-                    />
-                    {tag.name}
+                    <button
+                      type="button"
+                      onClick={() => openEdit(tag)}
+                      aria-label={t('editAria', { name: tag.name })}
+                      className="inline-flex items-center gap-1.5 rounded-full hover:underline"
+                    >
+                      <span
+                        className="size-2 rounded-full"
+                        style={{ backgroundColor: tag.color }}
+                      />
+                      {tag.name}
+                    </button>
                     <button
                       type="button"
                       onClick={() => confirmDelete(tag)}
@@ -209,24 +263,8 @@ export function TagManager() {
                 maxLength={40}
                 className="min-w-[180px] flex-1"
               />
-              <div className="flex gap-1.5">
-                {PRESET_COLORS.map((color) => (
-                  <button
-                    key={color.value}
-                    type="button"
-                    onClick={() => setSelectedColor(color.value)}
-                    aria-label={t('useColor', { color: t(`colors.${color.name}` as Parameters<typeof t>[0]) })}
-                    aria-pressed={selectedColor === color.value}
-                    className={cn(
-                      'size-6 rounded-md transition-transform hover:scale-110',
-                      selectedColor === color.value &&
-                        'outline outline-2 outline-offset-2 outline-primary',
-                    )}
-                    style={{ backgroundColor: color.value }}
-                    title={t(`colors.${color.name}` as Parameters<typeof t>[0])}
-                  />
-                ))}
-              </div>
+              <ColorSwatches value={selectedColor} onChange={setSelectedColor} />
+
               <Button
                 variant="outline"
                 size="sm"
@@ -244,6 +282,52 @@ export function TagManager() {
           </>
         )}
       </CardContent>
+
+      {/* Edit name + colour */}
+      <Dialog
+        open={tagToEdit !== null}
+        onOpenChange={(open) => {
+          if (!open) setTagToEdit(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t('editTag')}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input
+              id="edit-tag-name"
+              value={editName}
+              onChange={(e) => setEditName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleUpdate();
+              }}
+              disabled={updating}
+              maxLength={40}
+            />
+            <ColorSwatches value={editColor} onChange={setEditColor} />
+          </div>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => setTagToEdit(null)}
+              disabled={updating}
+            >
+              {t('cancel')}
+            </Button>
+            <Button onClick={handleUpdate} disabled={updating || !editName.trim()}>
+              {updating ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  {t('saving')}
+                </>
+              ) : (
+                t('save')
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete confirmation */}
       <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
@@ -280,5 +364,36 @@ export function TagManager() {
         </DialogContent>
       </Dialog>
     </Card>
+  );
+}
+
+/** The preset colour row, shared by the create row and the edit dialog. */
+function ColorSwatches({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (color: string) => void;
+}) {
+  const t = useTranslations('Settings.tagsAndFields');
+  return (
+    <div className="flex gap-1.5">
+      {PRESET_COLORS.map((color) => (
+        <button
+          key={color.value}
+          type="button"
+          onClick={() => onChange(color.value)}
+          aria-label={t('useColor', { color: t(`colors.${color.name}` as Parameters<typeof t>[0]) })}
+          aria-pressed={value === color.value}
+          className={cn(
+            'size-6 rounded-md transition-transform hover:scale-110',
+            value === color.value &&
+              'outline outline-2 outline-offset-2 outline-primary',
+          )}
+          style={{ backgroundColor: color.value }}
+          title={t(`colors.${color.name}` as Parameters<typeof t>[0])}
+        />
+      ))}
+    </div>
   );
 }

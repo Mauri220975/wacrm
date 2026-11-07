@@ -1239,7 +1239,7 @@
       },
       "tags": {
         "select": "Selecione uma tag…",
-        "placeholder": "ID da tag",
+        "none": "Ainda não há tags. Crie-as primeiro em Configurações → Campos e tags.",
         "unknown": "{id} (tag desconhecida)"
       },
       "fields": {
@@ -1316,7 +1316,6 @@
         "placeholderTime": "HH:mm-HH:mm",
         "timezoneLabel": "Fuso horário",
         "placeholderContact": "nome / e-mail / empresa",
-        "placeholderTag": "id da tag",
         "urlLabel": "URL",
         "headersLabel": "Cabeçalhos",
         "placeholderHeaders": "{\"Authorization\": \"Bearer ...\"}",
@@ -1715,6 +1714,12 @@
       "deleteConfirm": "Excluir a tag \"{name}\"? Isso a remove de todos os contatos e não pode ser desfeito.",
       "cancel": "Cancelar",
       "deleting": "Excluindo...",
+      "editAria": "Editar {name}",
+      "editTag": "Editar tag",
+      "save": "Salvar",
+      "saving": "Salvando...",
+      "tagUpdated": "Tag atualizada",
+      "failedToUpdateTag": "Falha ao atualizar a tag",
       "colors": {
         "red": "Vermelho",
         "orange": "Laranja",

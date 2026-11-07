@@ -1239,7 +1239,7 @@
       },
       "tags": {
         "select": "Selecciona una etiqueta…",
-        "placeholder": "ID de etiqueta",
+        "none": "Aún no hay etiquetas. Créalas primero en Configuración → Campos y etiquetas.",
         "unknown": "{id} (etiqueta desconocida)"
       },
       "fields": {
@@ -1316,7 +1316,6 @@
         "placeholderTime": "HH:mm-HH:mm",
         "timezoneLabel": "Zona horaria",
         "placeholderContact": "name / email / company",
-        "placeholderTag": "id de etiqueta",
         "urlLabel": "URL",
         "headersLabel": "Encabezados",
         "placeholderHeaders": "{\"Authorization\": \"Bearer ...\"}",
@@ -1715,6 +1714,12 @@
       "deleteConfirm": "¿Eliminar la etiqueta \"{name}\"? Se quitará de todos los contactos y no se puede deshacer.",
       "cancel": "Cancelar",
       "deleting": "Eliminando...",
+      "editAria": "Editar {name}",
+      "editTag": "Editar etiqueta",
+      "save": "Guardar",
+      "saving": "Guardando...",
+      "tagUpdated": "Etiqueta actualizada",
+      "failedToUpdateTag": "Error al actualizar la etiqueta",
       "colors": {
         "red": "Rojo",
         "orange": "Naranja",

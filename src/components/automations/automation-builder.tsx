@@ -337,8 +337,9 @@ function ResourcesProvider({ children }: { children: ReactNode }) {
 const SELECT_CLASS =
   "w-full rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-foreground focus:border-primary focus:outline-none"
 
-/** Tag dropdown by name + color, storing the tag's id. Falls back to a
- *  raw id input when no tags exist yet. */
+/** Tag dropdown by name + color, storing the tag's id. With no tags yet it
+ *  points at Settings instead of a free-text box: the engine matches on
+ *  tag id, so a typed name would save fine and then never match. */
 function TagSelect({
   value,
   onChange,
@@ -350,14 +351,7 @@ function TagSelect({
 }) {
   const { tags } = useResources()
   if (tags.length === 0) {
-    return (
-      <Input
-        placeholder={t("tags.placeholder")}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="bg-muted text-foreground"
-      />
-    )
+    return <p className="text-xs text-muted-foreground">{t("tags.none")}</p>
   }
   const selected = tags.find((t) => t.id === value)
   return (
@@ -1330,7 +1324,9 @@ function ConditionEditor({
       <FieldBlock label={t("config.subjectLabel")}>
         <select
           value={subject}
-          onChange={(e) => set({ subject: e.target.value })}
+          // An operand only means something for the subject it was entered
+          // under (a tag id isn't a clock window), so start the new one clean.
+          onChange={(e) => set({ subject: e.target.value, operand: "", value: "" })}
           className="w-full rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-foreground"
         >
           <option value="tag_presence">{t("config.subjects.tag_presence")}</option>
@@ -1339,7 +1335,16 @@ function ConditionEditor({
           <option value="time_of_day">{t("config.subjects.time_of_day")}</option>
         </select>
       </FieldBlock>
-      {subject !== "message_content" && (
+      {subject === "tag_presence" && (
+        <FieldBlock label={t("config.operandLabel")}>
+          <TagSelect
+            value={(cfg.operand as string) ?? ""}
+            onChange={(v) => set({ operand: v })}
+            t={t}
+          />
+        </FieldBlock>
+      )}
+      {subject !== "message_content" && subject !== "tag_presence" && (
         <FieldBlock label={t("config.operandLabel")}>
           <Input
             placeholder={
@@ -1347,8 +1352,6 @@ function ConditionEditor({
                 ? t("config.placeholderTime")
                 : subject === "contact_field"
                 ? t("config.placeholderContact")
-                : subject === "tag_presence"
-                ? t("config.placeholderTag")
                 : ""
             }
             value={(cfg.operand as string) ?? ""}
