@@ -5,7 +5,8 @@ import { loadAiConfig } from '@/lib/ai/config'
 import { retrieveKnowledge } from '@/lib/ai/knowledge'
 import { generateReply } from '@/lib/ai/generate'
 import { buildSystemPrompt } from '@/lib/ai/defaults'
-import { latestUserMessage } from '@/lib/ai/query'
+import { latestUserMessage, recentCustomerText } from '@/lib/ai/query'
+import { lookupInventoryForPrompt } from '@/lib/inventory/lookup'
 import { AiError, type ChatMessage } from '@/lib/ai/types'
 import { getT } from '@/lib/i18n/translate'
 
@@ -75,16 +76,15 @@ export async function POST(request: Request) {
       )
     }
 
-    const knowledge = await retrieveKnowledge(
-      supabase,
-      accountId,
-      config,
-      latestUserMessage(messages),
-    )
+    const [knowledge, inventory] = await Promise.all([
+      retrieveKnowledge(supabase, accountId, config, latestUserMessage(messages)),
+      lookupInventoryForPrompt(supabase, accountId, recentCustomerText(messages)),
+    ])
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
       knowledge,
+      inventory,
     })
 
     const { text, handoff } = await generateReply({ config, systemPrompt, messages })

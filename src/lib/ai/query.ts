@@ -12,3 +12,16 @@ export function latestUserMessage(messages: ChatMessage[]): string {
   }
   return messages.length > 0 ? messages[messages.length - 1].content : ''
 }
+
+/**
+ * The last few customer turns joined, newest last — used for the
+ * inventory lookup so "jersey 30" in one message and "¿en negro?" in
+ * the next are read together.
+ */
+export function recentCustomerText(messages: ChatMessage[], turns = 3): string {
+  const out: string[] = []
+  for (let i = messages.length - 1; i >= 0 && out.length < turns; i--) {
+    if (messages[i].role === 'user') out.unshift(messages[i].content)
+  }
+  return out.join('\n')
+}

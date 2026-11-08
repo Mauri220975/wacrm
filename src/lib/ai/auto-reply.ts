@@ -6,7 +6,8 @@ import { generateReply } from './generate'
 import { buildSystemPrompt } from './defaults'
 import { buildHandoffSummary } from './handoff'
 import { logAiUsage } from './usage'
-import { latestUserMessage } from './query'
+import { latestUserMessage, recentCustomerText } from './query'
+import { lookupInventoryForPrompt } from '@/lib/inventory/lookup'
 import {
   engineSendText,
   loadAccountMetaCredentials,
@@ -123,17 +124,16 @@ export async function dispatchInboundToAiReply(
     }
 
     // Ground the reply in the account's knowledge base (best-effort).
-    const knowledge = await retrieveKnowledge(
-      db,
-      accountId,
-      config,
-      latestUserMessage(messages),
-    )
+    const [knowledge, inventory] = await Promise.all([
+      retrieveKnowledge(db, accountId, config, latestUserMessage(messages)),
+      lookupInventoryForPrompt(db, accountId, recentCustomerText(messages)),
+    ])
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
       knowledge,
+      inventory,
     })
 
     const { text, handoff, usage } = await generateReply({

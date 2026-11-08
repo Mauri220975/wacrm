@@ -6,7 +6,8 @@ import { buildConversationContext } from '@/lib/ai/context'
 import { retrieveKnowledge } from '@/lib/ai/knowledge'
 import { generateReply } from '@/lib/ai/generate'
 import { buildSystemPrompt } from '@/lib/ai/defaults'
-import { latestUserMessage } from '@/lib/ai/query'
+import { latestUserMessage, recentCustomerText } from '@/lib/ai/query'
+import { lookupInventoryForPrompt } from '@/lib/inventory/lookup'
 import { logAiUsage } from '@/lib/ai/usage'
 import { supabaseAdmin } from '@/lib/ai/admin-client'
 import { AiError } from '@/lib/ai/types'
@@ -94,17 +95,16 @@ export async function POST(request: Request) {
 
     // Ground the draft in the account's knowledge base (best-effort —
     // returns [] when there's no KB or retrieval fails).
-    const knowledge = await retrieveKnowledge(
-      supabase,
-      accountId,
-      config,
-      latestUserMessage(messages),
-    )
+    const [knowledge, inventory] = await Promise.all([
+      retrieveKnowledge(supabase, accountId, config, latestUserMessage(messages)),
+      lookupInventoryForPrompt(supabase, accountId, recentCustomerText(messages)),
+    ])
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'draft',
       knowledge,
+      inventory,
     })
 
     const { text, usage } = await generateReply({ config, systemPrompt, messages })
