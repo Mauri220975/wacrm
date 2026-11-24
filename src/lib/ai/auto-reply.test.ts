@@ -10,7 +10,10 @@ const h = vi.hoisted(() => ({
   engineSendText: vi.fn(),
   loadAccountMetaCredentials: vi.fn(),
   sendTypingIndicator: vi.fn(),
+  sendTextMessage: vi.fn(),
+  sendTemplateMessage: vi.fn(),
   state: {
+    contact: { name: 'Ana', phone: '51999888777' } as Record<string, unknown> | null,
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
     claim: true as boolean,
@@ -31,6 +34,8 @@ vi.mock('@/lib/flows/meta-send', () => ({
 }))
 vi.mock('@/lib/whatsapp/meta-api', () => ({
   sendTypingIndicator: h.sendTypingIndicator,
+  sendTextMessage: h.sendTextMessage,
+  sendTemplateMessage: h.sendTemplateMessage,
 }))
 vi.mock('./admin-client', () => ({
   supabaseAdmin: () => ({
@@ -55,6 +60,16 @@ vi.mock('./admin-client', () => ({
             Promise.resolve({ data: h.state.latestInbound, error: null }),
         }
         return chain
+      }
+      if (table === 'contacts') {
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: () =>
+                Promise.resolve({ data: h.state.contact, error: null }),
+            }),
+          }),
+        }
       }
       // conversations
       return {
@@ -119,6 +134,12 @@ beforeEach(() => {
     ai_reply_count: 0,
   }
   h.state.autoResponders = []
+  h.state.contact = { name: 'Ana', phone: '51999888777' }
+  delete process.env.AI_HANDOFF_NOTIFY_PHONE
+  delete process.env.AI_HANDOFF_NOTIFY_TEMPLATE
+  delete process.env.AI_HANDOFF_MESSAGES
+  h.sendTextMessage.mockReset().mockResolvedValue({ messageId: 'n1' })
+  h.sendTemplateMessage.mockReset().mockResolvedValue({ messageId: 'n2' })
   h.state.claim = true
   h.state.updatePayload = null
   h.state.updates = []
@@ -312,27 +333,46 @@ describe('dispatchInboundToAiReply — typing indicator (#527)', () => {
   })
 })
 
-describe('dispatchInboundToAiReply — handoff', () => {
-  it('disables auto-reply, writes a summary, and does not send on handoff', async () => {
+describe('dispatchInboundToAiReply — soft handoff', () => {
+  it('writes a summary, keeps the bot active, and sends a courtesy message', async () => {
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).not.toHaveBeenCalled()
-    expect(h.state.rpcCalls).toHaveLength(0)
-    expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText.mock.calls[0][0].text).toMatch(/asesor/)
+    expect(h.engineSendText.mock.calls[0][0].aiGenerated).toBe(true)
+    expect(h.state.updatePayload).not.toHaveProperty('ai_autoreply_disabled')
     expect(h.state.updatePayload?.ai_handoff_summary).toContain(
       'AI agent handed off',
     )
     // No handoff target configured → conversation left unassigned.
     expect(h.state.updatePayload).not.toHaveProperty('assigned_agent_id')
+    // No advisor phone configured → no alert.
+    expect(h.sendTextMessage).not.toHaveBeenCalled()
   })
 
-  it('routes to the configured handoff agent on handoff', async () => {
-    h.loadAiConfig.mockResolvedValue(aiConfig({ handoffAgentId: 'agent-7' }))
+  it('uses the configured courtesy messages', async () => {
+    process.env.AI_HANDOFF_MESSAGES = 'Uno || Dos'
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    expect(h.state.updatePayload).toMatchObject({
-      ai_autoreply_disabled: true,
-      assigned_agent_id: 'agent-7',
+    expect(['Uno', 'Dos']).toContain(h.engineSendText.mock.calls[0][0].text)
+  })
+
+  it('alerts the advisor on WhatsApp (text, or template when configured)', async () => {
+    process.env.AI_HANDOFF_NOTIFY_PHONE = '+39 375 677 0291'
+    h.generateReply.mockResolvedValue({ text: '', handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.sendTextMessage).toHaveBeenCalledTimes(1)
+    expect(h.sendTextMessage.mock.calls[0][0].to).toBe('393756770291')
+    expect(h.sendTextMessage.mock.calls[0][0].text).toContain('Ana · +51999888777')
+
+    process.env.AI_HANDOFF_NOTIFY_TEMPLATE = 'aviso_asesor'
+    h.state.conv = { ...h.state.conv, ai_handoff_summary: null }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.sendTemplateMessage).toHaveBeenCalledTimes(1)
+    expect(h.sendTemplateMessage.mock.calls[0][0]).toMatchObject({
+      templateName: 'aviso_asesor',
+      language: 'es',
+      params: ['Ana · +51999888777', 'hi'],
     })
   })
 
@@ -340,11 +380,44 @@ describe('dispatchInboundToAiReply — handoff', () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ handoffAgentId: 'agent-7' }))
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    const pause = h.state.updates.find((u) => 'ai_autoreply_disabled' in u.payload)
     const assign = h.state.updates.find((u) => 'assigned_agent_id' in u.payload)
-    expect(pause?.payload).not.toHaveProperty('assigned_agent_id')
-    expect(pause?.isNull).toEqual([])
     expect(assign?.payload).toEqual({ assigned_agent_id: 'agent-7' })
     expect(assign?.isNull).toEqual(['assigned_agent_id'])
+  })
+
+  it('keeps replying while the handoff is pending, even if assigned', async () => {
+    h.state.conv = {
+      assigned_agent_id: 'agent-7',
+      ai_autoreply_disabled: false,
+      ai_reply_count: 1,
+      ai_handoff_summary: '🤖 AI agent handed off',
+    }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendText.mock.calls[0][0].text).toBe('Hello!')
+  })
+
+  it('sends a short reminder (no second alert) on a repeat handoff', async () => {
+    process.env.AI_HANDOFF_NOTIFY_PHONE = '393756770291'
+    h.state.conv = { ...h.state.conv, ai_handoff_summary: '🤖 AI agent handed off' }
+    h.generateReply.mockResolvedValue({ text: '', handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.rpcCalls).toHaveLength(1)
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.sendTextMessage).not.toHaveBeenCalled()
+  })
+
+  it('stops once a human replied (ai_autoreply_disabled)', async () => {
+    h.state.conv = { ...h.state.conv, ai_autoreply_disabled: true, ai_handoff_summary: 'x' }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.generateReply).not.toHaveBeenCalled()
+    expect(h.engineSendText).not.toHaveBeenCalled()
+  })
+
+  it('never auto-replies to the advisor number', async () => {
+    process.env.AI_HANDOFF_NOTIFY_PHONE = '393756770291'
+    h.state.contact = { name: 'Asesor', phone: '393756770291' }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.generateReply).not.toHaveBeenCalled()
   })
 })

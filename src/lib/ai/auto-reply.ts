@@ -5,6 +5,13 @@ import { retrieveKnowledge } from './knowledge'
 import { generateReply } from './generate'
 import { buildSystemPrompt } from './defaults'
 import { buildHandoffSummary } from './handoff'
+import {
+  DEFAULT_REMINDER_MESSAGES,
+  handoffMessages,
+  isAdvisorPhone,
+  notifyAdvisor,
+  pickRandom,
+} from './handoff-notify'
 import { logAiUsage } from './usage'
 import { latestUserMessage, recentCustomerText } from './query'
 import { lookupInventoryForPrompt } from '@/lib/inventory/lookup'
@@ -39,8 +46,11 @@ interface DispatchArgs {
  *
  * Eligibility gates (any → silent no-op):
  *   - AI off / auto-reply disabled for the account
- *   - a human agent is assigned (they own the thread)
- *   - auto-reply was disabled for this conversation (prior handoff)
+ *   - a human agent is assigned (they own the thread) — unless the bot
+ *     itself routed it there in a soft handoff and no human replied yet
+ *   - auto-reply was disabled for this conversation (an agent replied,
+ *     or someone paused it from the inbox)
+ *   - the contact is the advisor's own number (AI_HANDOFF_NOTIFY_PHONE)
  *   - the per-conversation reply cap is reached
  *   - there's nothing to reply to
  *
@@ -84,15 +94,29 @@ export async function dispatchInboundToAiReply(
 
     const { data: conv, error: convErr } = await db
       .from('conversations')
-      .select('assigned_agent_id, ai_autoreply_disabled, ai_reply_count')
+      .select(
+        'assigned_agent_id, ai_autoreply_disabled, ai_reply_count, ai_handoff_summary',
+      )
       .eq('id', conversationId)
       .maybeSingle()
     if (convErr || !conv) return
-    if (conv.assigned_agent_id) return // a human owns this thread
-    if (conv.ai_autoreply_disabled) return // handed off / turned off here
+    if (conv.ai_autoreply_disabled) return // agent replied / turned off here
+    // Soft handoff in progress: the advisor was alerted but hasn't
+    // replied yet (an agent reply sets ai_autoreply_disabled), so the
+    // bot keeps the customer company even if it assigned the thread.
+    const softPending = !!conv.ai_handoff_summary
+    if (conv.assigned_agent_id && !softPending) return // a human owns this thread
     // Cheap early-out; the authoritative cap check is the atomic claim
     // below (this read can race a concurrent inbound).
     if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
+
+    const { data: contact } = await db
+      .from('contacts')
+      .select('name, phone')
+      .eq('id', contactId)
+      .maybeSingle()
+    // Never let the bot chat with the advisor who receives the alerts.
+    if (isAdvisorPhone(contact?.phone)) return
 
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
@@ -134,6 +158,7 @@ export async function dispatchInboundToAiReply(
       mode: 'auto_reply',
       knowledge,
       inventory,
+      advisorNotified: softPending,
     })
 
     const { text, handoff, usage } = await generateReply({
@@ -157,29 +182,81 @@ export async function dispatchInboundToAiReply(
     })
 
     if (handoff || !text) {
-      // The model can't (or shouldn't) answer — stop auto-replying on
-      // this thread and hand it to a human. We (a) pause the bot here
-      // (sticky until re-enabled), (b) route the conversation to the
-      // configured handoff agent — null leaves it in the shared queue —
-      // and (c) leave a short internal note so whoever picks it up has
-      // context. Assigning fires the `on_conversation_assigned` trigger,
-      // which notifies the agent.
+      // The model can't (or shouldn't) answer. Soft handoff: instead of
+      // going silent, tell the customer an advisor replies in ~20 min,
+      // alert the advisor on WhatsApp, and keep the bot active on this
+      // thread until a human actually replies from the inbox.
+      if (
+        inboundMessageId &&
+        (await hasNewerInbound(db, conversationId, inboundMessageId))
+      ) {
+        return
+      }
+
+      if (softPending) {
+        // Advisor already alerted — a short nudge, no second alert.
+        if (!(await claimSlot(db, conversationId, config))) return
+        await engineSendText({
+          accountId,
+          userId: configOwnerUserId,
+          conversationId,
+          contactId,
+          text: pickRandom(DEFAULT_REMINDER_MESSAGES),
+          aiGenerated: true,
+        })
+        return
+      }
+
       const summary = buildHandoffSummary({
         messages,
         replyCount: conv.ai_reply_count ?? 0,
       })
+      // ai_autoreply_disabled stays false: the summary marks the soft
+      // handoff (banner + dashboard) while the bot keeps chatting.
       await db
         .from('conversations')
-        .update({ ai_autoreply_disabled: true, ai_handoff_summary: summary })
+        .update({ ai_handoff_summary: summary })
         .eq('id', conversationId)
       // Only set the assignee when a target is configured AND the thread
       // isn't already owned — never stomp an existing human assignment.
+      // Assigning fires `on_conversation_assigned`, notifying the agent.
       if (config.handoffAgentId) {
         await db
           .from('conversations')
           .update({ assigned_agent_id: config.handoffAgentId })
           .eq('id', conversationId)
           .is('assigned_agent_id', null)
+      }
+
+      // The courtesy message is sent even at the reply cap's edge — the
+      // customer must never be left without an answer.
+      await engineSendText({
+        accountId,
+        userId: configOwnerUserId,
+        conversationId,
+        contactId,
+        text: pickRandom(handoffMessages()),
+        aiGenerated: true,
+      })
+
+      try {
+        const { phoneNumberId, accessToken } = await loadAccountMetaCredentials(
+          db,
+          accountId,
+        )
+        const lastCustomer = [...messages]
+          .reverse()
+          .find((m) => m.role === 'user' && m.content.trim())
+        await notifyAdvisor({
+          phoneNumberId,
+          accessToken,
+          customerLabel: [contact?.name, contact?.phone ? `+${contact.phone.replace(/\D/g, '')}` : null]
+            .filter(Boolean)
+            .join(' · ') || 'Cliente',
+          lastMessage: lastCustomer?.content ?? '',
+        })
+      } catch (err) {
+        console.warn('[ai auto-reply] advisor alert skipped:', err)
       }
       return
     }
@@ -191,27 +268,7 @@ export async function dispatchInboundToAiReply(
       return
     }
 
-    // Atomically claim a reply slot: the cap check + increment happen in
-    // one UPDATE, so concurrent inbounds can never overshoot the cap. If
-    // another inbound just took the last slot, `claimed` is false and we
-    // skip the send. (We consume a slot slightly before the send lands —
-    // fail-safe: under-reply rather than over-reply.)
-    const { data: claimed, error: claimErr } = await db.rpc(
-      'claim_ai_reply_slot',
-      {
-        conversation_id: conversationId,
-        max_replies: config.autoReplyMaxPerConversation,
-      },
-    )
-    if (claimErr) {
-      // A real error here (vs. losing the cap race) is almost always a
-      // deploy issue — e.g. `claim_ai_reply_slot` not EXECUTE-able by the
-      // service role, or the migration not applied. Log it loudly: a
-      // silent return makes "auto-reply never fires" undiagnosable.
-      console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr)
-      return
-    }
-    if (claimed !== true) return
+    if (!(await claimSlot(db, conversationId, config))) return
 
     await engineSendText({
       accountId,
@@ -224,6 +281,36 @@ export async function dispatchInboundToAiReply(
   } catch (err) {
     console.error('[ai auto-reply] dispatch failed:', err)
   }
+}
+
+/**
+ * Atomically claim a reply slot: the cap check + increment happen in
+ * one UPDATE, so concurrent inbounds can never overshoot the cap. If
+ * another inbound just took the last slot this returns false and the
+ * caller skips the send. (We consume a slot slightly before the send
+ * lands — fail-safe: under-reply rather than over-reply.)
+ */
+async function claimSlot(
+  db: ReturnType<typeof supabaseAdmin>,
+  conversationId: string,
+  config: { autoReplyMaxPerConversation: number },
+): Promise<boolean> {
+  const { data: claimed, error: claimErr } = await db.rpc(
+    'claim_ai_reply_slot',
+    {
+      conversation_id: conversationId,
+      max_replies: config.autoReplyMaxPerConversation,
+    },
+  )
+  if (claimErr) {
+    // A real error here (vs. losing the cap race) is almost always a
+    // deploy issue — e.g. `claim_ai_reply_slot` not EXECUTE-able by the
+    // service role, or the migration not applied. Log it loudly: a
+    // silent return makes "auto-reply never fires" undiagnosable.
+    console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr)
+    return false
+  }
+  return claimed === true
 }
 
 async function hasNewerInbound(

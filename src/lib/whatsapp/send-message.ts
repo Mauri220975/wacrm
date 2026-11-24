@@ -521,6 +521,9 @@ export async function sendMessageToConversation(
       last_message_text: lastMessageText,
       last_message_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+      // A human replied — the AI bot yields on this thread (it can be
+      // re-enabled from the inbox banner). Ends any soft handoff.
+      ai_autoreply_disabled: true,
     })
     .eq('id', conversationId);
 
