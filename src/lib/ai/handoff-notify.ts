@@ -1,43 +1,77 @@
 import {
   sendTemplateMessage,
   sendTextMessage,
+  type InteractiveButton,
 } from '@/lib/whatsapp/meta-api'
 
 /**
  * "Soft" handoff helpers for the AI auto-reply bot.
  *
  * When the model can't answer (e.g. a price question with no prices in
- * the knowledge base) the bot no longer goes silent: it tells the
- * customer an advisor will reply shortly, keeps the conversation going,
- * and pings a human advisor on WhatsApp.
+ * the knowledge base) the bot no longer goes silent: it alerts a human
+ * advisor on WhatsApp and sends the customer a message with three
+ * buttons — new question / keep waiting / request a quote.
  *
  * Configuration (env, all optional):
- *   AI_HANDOFF_MESSAGES            courtesy messages, separated by "||"
- *                                  (one is picked at random)
+ *   AI_HANDOFF_MESSAGES            body of the button message, several
+ *                                  separated by "||" (one picked at random)
  *   AI_HANDOFF_NOTIFY_PHONE        advisor's WhatsApp number, digits with
  *                                  country code (e.g. 393756770291)
  *   AI_HANDOFF_NOTIFY_TEMPLATE     approved template name for the advisor
  *                                  alert; body {{1}} = customer, {{2}} = last
- *                                  message. Without it a free-form text is
- *                                  sent, which Meta only delivers when the
- *                                  advisor wrote to the business number in
- *                                  the last 24 h.
+ *                                  message / quote. Without it a free-form
+ *                                  text is sent, which Meta only delivers
+ *                                  when the advisor wrote to the business
+ *                                  number in the last 24 h.
  *   AI_HANDOFF_NOTIFY_TEMPLATE_LANG template language code (default "es")
  */
 
-export const DEFAULT_HANDOFF_MESSAGES = [
-  '¡Gracias por tu consulta! 😊 Un asesor te responderá en unos 20 minutos con los precios. Mientras tanto, ¿tienes alguna otra consulta en la que te pueda ayudar?',
-  '¡Excelente elección! 🙌 Ya le pasé tu consulta a un asesor y en aproximadamente 20 minutos te escribe con los precios. ¿Hay algo más que quieras saber de nuestras telas?',
-  '¡Gracias por escribirnos! Un asesor revisará tu pedido y te enviará los precios en unos 20 minutos ⏱️. ¿Te puedo ayudar con alguna otra duda mientras tanto?',
-  '¡Con gusto! 😊 Un asesor te confirmará los precios en unos 20 minutos. Mientras esperas, cuéntame: ¿tienes alguna otra consulta sobre colores o tipos de tela?',
+/** Button ids — the webhook routes taps with this prefix to the bot. */
+export const HANDOFF_BUTTON_PREFIX = 'ai_ho:'
+export type HandoffChoice = 'new' | 'wait' | 'quote'
+
+export const HANDOFF_BUTTONS: InteractiveButton[] = [
+  { id: `${HANDOFF_BUTTON_PREFIX}new`, title: '💬 Nueva consulta' },
+  { id: `${HANDOFF_BUTTON_PREFIX}wait`, title: '⏳ Seguir esperando' },
+  { id: `${HANDOFF_BUTTON_PREFIX}quote`, title: '📋 Pedir cotización' },
 ]
 
-/** Short nudge for when the customer pushes again while an advisor is
- *  already on the way — keeps the thread warm without re-alerting. */
-export const DEFAULT_REMINDER_MESSAGES = [
-  'Ya avisé a un asesor y en breve te escribe 🙏. ¿Hay algo más en lo que te pueda ayudar mientras tanto?',
-  'Tu consulta ya está con un asesor, te responderá en unos minutos 😊. ¿Tienes alguna otra pregunta?',
+export function parseHandoffChoice(
+  replyId: string | null | undefined,
+): HandoffChoice | null {
+  if (!replyId || !replyId.startsWith(HANDOFF_BUTTON_PREFIX)) return null
+  const choice = replyId.slice(HANDOFF_BUTTON_PREFIX.length)
+  return choice === 'new' || choice === 'wait' || choice === 'quote'
+    ? choice
+    : null
+}
+
+/** Typed-text replies the bot gives while the menu is open before it
+ *  shows the buttons again. */
+export const MENU_FREE_REPLY_LIMIT = 2
+
+export const DEFAULT_HANDOFF_MESSAGES = [
+  '¡Gracias por tu consulta! 😊 Un asesor te responderá en unos 20 minutos. Mientras tanto, ¿qué prefieres?',
+  '¡Excelente elección! 🙌 Ya le pasé tu consulta a un asesor y en aproximadamente 20 minutos te escribe. Mientras tanto, ¿qué te gustaría hacer?',
+  '¡Gracias por escribirnos! Un asesor revisará tu consulta y te responderá en unos 20 minutos ⏱️. ¿Cómo prefieres continuar?',
+  '¡Con gusto! 😊 Un asesor te escribirá en unos 20 minutos. Mientras esperas, elige una opción:',
 ]
+
+/** Body used when the menu is shown again (advisor already alerted). */
+export const DEFAULT_REMINDER_MESSAGES = [
+  'Tu consulta ya está con un asesor y te escribirá en breve 🙏. ¿Cómo prefieres continuar?',
+  'El asesor ya está avisado 😊. Mientras tanto, ¿qué te gustaría hacer?',
+]
+
+export const CHOICE_REPLIES: Record<HandoffChoice, string> = {
+  new: '¡Claro! 😊 ¿En qué más te puedo ayudar?',
+  wait: 'Perfecto 👍 El asesor ya está avisado y te escribirá en breve. ¡Gracias por tu paciencia!',
+  quote:
+    '¡Genial! 📋 Para preparar tu cotización necesito: tipo de tela, color, cantidad en kilos y distrito de entrega. ¿Me los indicas?',
+}
+
+export const QUOTE_SENT_REPLY =
+  '¡Listo! ✅ Envié tu solicitud de cotización al asesor. Te escribirá en breve con los precios. ¡Gracias por elegir Mpunto!'
 
 function splitList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -77,12 +111,15 @@ export async function notifyAdvisor(args: {
   phoneNumberId: string
   accessToken: string
   customerLabel: string
+  /** Last customer message (handoff) or the quote summary (quote). */
   lastMessage: string
+  kind?: 'handoff' | 'quote'
 }): Promise<void> {
   const to = handoffNotifyPhone()
   if (!to) return
-  const { phoneNumberId, accessToken, customerLabel } = args
-  const lastMessage = args.lastMessage.replace(/\s+/g, ' ').trim().slice(0, 300)
+  const { phoneNumberId, accessToken, customerLabel, kind = 'handoff' } = args
+  const detail =
+    args.lastMessage.replace(/\s+/g, ' ').trim().slice(0, 300) || '-'
   const template = (process.env.AI_HANDOFF_NOTIFY_TEMPLATE ?? '').trim()
   try {
     if (template) {
@@ -92,7 +129,7 @@ export async function notifyAdvisor(args: {
         to,
         templateName: template,
         language: (process.env.AI_HANDOFF_NOTIFY_TEMPLATE_LANG ?? 'es').trim() || 'es',
-        params: [customerLabel, lastMessage || '-'],
+        params: [customerLabel, kind === 'quote' ? `COTIZACIÓN: ${detail}` : detail],
       })
     } else {
       await sendTextMessage({
@@ -100,10 +137,9 @@ export async function notifyAdvisor(args: {
         accessToken,
         to,
         text:
-          `🔔 Cliente esperando asesor\n` +
-          `Cliente: ${customerLabel}\n` +
-          `Mensaje: "${lastMessage || '-'}"\n` +
-          `El bot le dijo que un asesor responde en ~20 min. Atiéndelo desde el Inbox del CRM.`,
+          kind === 'quote'
+            ? `📋 Solicitud de cotización\nCliente: ${customerLabel}\nPedido: ${detail}\nRespóndele desde el Inbox del CRM.`
+            : `🔔 Cliente esperando asesor\nCliente: ${customerLabel}\nMensaje: "${detail}"\nEl bot le dijo que un asesor responde en ~20 min. Atiéndelo desde el Inbox del CRM.`,
       })
     }
   } catch (err) {

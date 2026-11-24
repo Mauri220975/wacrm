@@ -22,6 +22,7 @@ import { readCappedBody } from '@/lib/whatsapp/webhook-body'
 import { resumeAwaitingReply, runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
+import { parseHandoffChoice } from '@/lib/ai/handoff-notify'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
   applyBroadcastRecipientStatus,
@@ -904,8 +905,15 @@ async function processMessage(
   // the account has enabled it. Awaited inside `after()` (same reason as
   // the webhook dispatch below); `dispatchInboundToAiReply` owns its
   // eligibility gates + try/catch and never throws.
-  if (!contentConsumed && !interactiveReplyId && inboundText.trim()) {
+  // Taps on the bot's own handoff buttons ("Nueva consulta" / "Seguir
+  // esperando" / "Pedir cotización") are routed to it as well.
+  const handoffChoice = parseHandoffChoice(interactiveReplyId)
+  if (
+    !contentConsumed &&
+    (handoffChoice || (!interactiveReplyId && inboundText.trim()))
+  ) {
     await dispatchInboundToAiReply({
+      handoffChoice: handoffChoice ?? undefined,
       accountId,
       conversationId: conversation.id,
       contactId: contactRecord.id,

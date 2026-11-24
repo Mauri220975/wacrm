@@ -3,19 +3,26 @@ import { loadAiConfig } from './config'
 import { buildConversationContext } from './context'
 import { retrieveKnowledge } from './knowledge'
 import { generateReply } from './generate'
-import { buildSystemPrompt } from './defaults'
+import { buildSystemPrompt, QUOTE_SENTINEL } from './defaults'
 import { buildHandoffSummary } from './handoff'
 import {
+  CHOICE_REPLIES,
   DEFAULT_REMINDER_MESSAGES,
+  HANDOFF_BUTTONS,
+  MENU_FREE_REPLY_LIMIT,
+  QUOTE_SENT_REPLY,
   handoffMessages,
   isAdvisorPhone,
   notifyAdvisor,
   pickRandom,
+  type HandoffChoice,
 } from './handoff-notify'
+import type { ChatMessage } from './types'
 import { logAiUsage } from './usage'
 import { latestUserMessage, recentCustomerText } from './query'
 import { lookupInventoryForPrompt } from '@/lib/inventory/lookup'
 import {
+  engineSendInteractiveButtons,
   engineSendText,
   loadAccountMetaCredentials,
 } from '@/lib/flows/meta-send'
@@ -34,7 +41,16 @@ interface DispatchArgs {
    *  a typing indicator (which also marks it read) is shown while the
    *  reply is generated. Optional so older callers keep working. */
   inboundMessageId?: string
+  /** Set when the inbound is a tap on one of the bot's handoff buttons
+   *  (see HANDOFF_BUTTONS); the webhook parses it from the reply id. */
+  handoffChoice?: HandoffChoice
 }
+
+type HandoffStage = 'menu' | 'waiting' | 'quote' | null
+
+/** Silence after which a customer message starts a fresh bot
+ *  conversation — same as WhatsApp's customer-service window. */
+const NEW_CONVERSATION_GAP_MS = 24 * 60 * 60 * 1000
 
 /**
  * AI auto-reply for a freshly-arrived inbound message.
@@ -44,19 +60,25 @@ interface DispatchArgs {
  * runner's contract: it owns its try/catch and NEVER throws — a failing
  * or slow LLM call must not affect the webhook's 200 to Meta.
  *
+ * Soft handoff: when the model can't answer, the bot alerts the advisor
+ * (AI_HANDOFF_NOTIFY_PHONE) and sends three buttons. The conversation's
+ * `ai_handoff_stage` then drives what happens:
+ *   - 'menu'    typed text gets up to MENU_FREE_REPLY_LIMIT bot replies,
+ *               then the buttons are shown again
+ *   - 'waiting' ("Seguir esperando", or after a quote) — bot stays quiet
+ *   - 'quote'   ("Pedir cotización") bot collects the details and sends
+ *               the advisor a summary
+ *   - "Nueva consulta" returns to a normal conversation (counter reset)
+ * A customer message after more than 24 h of silence resets everything.
+ *
  * Eligibility gates (any → silent no-op):
  *   - AI off / auto-reply disabled for the account
- *   - a human agent is assigned (they own the thread) — unless the bot
- *     itself routed it there in a soft handoff and no human replied yet
+ *   - the contact is the advisor's own number
  *   - auto-reply was disabled for this conversation (an agent replied,
  *     or someone paused it from the inbox)
- *   - the contact is the advisor's own number (AI_HANDOFF_NOTIFY_PHONE)
+ *   - a human agent is assigned and no soft handoff is open
  *   - the per-conversation reply cap is reached
  *   - there's nothing to reply to
- *
- * The 24h WhatsApp session window is inherently open here — we're
- * reacting to a customer message that just landed — so no separate
- * window check is needed.
  */
 export async function dispatchInboundToAiReply(
   args: DispatchArgs,
@@ -67,6 +89,7 @@ export async function dispatchInboundToAiReply(
     contactId,
     configOwnerUserId,
     inboundMessageId,
+    handoffChoice,
   } = args
 
   try {
@@ -95,20 +118,14 @@ export async function dispatchInboundToAiReply(
     const { data: conv, error: convErr } = await db
       .from('conversations')
       .select(
-        'assigned_agent_id, ai_autoreply_disabled, ai_reply_count, ai_handoff_summary',
+        'assigned_agent_id, ai_autoreply_disabled, ai_reply_count, ai_handoff_summary, ai_handoff_stage, ai_handoff_free_replies',
       )
       .eq('id', conversationId)
       .maybeSingle()
-    if (convErr || !conv) return
-    if (conv.ai_autoreply_disabled) return // agent replied / turned off here
-    // Soft handoff in progress: the advisor was alerted but hasn't
-    // replied yet (an agent reply sets ai_autoreply_disabled), so the
-    // bot keeps the customer company even if it assigned the thread.
-    const softPending = !!conv.ai_handoff_summary
-    if (conv.assigned_agent_id && !softPending) return // a human owns this thread
-    // Cheap early-out; the authoritative cap check is the atomic claim
-    // below (this read can race a concurrent inbound).
-    if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
+    if (convErr || !conv) {
+      if (convErr) console.error('[ai auto-reply] conversation read failed:', convErr)
+      return
+    }
 
     const { data: contact } = await db
       .from('contacts')
@@ -117,6 +134,96 @@ export async function dispatchInboundToAiReply(
       .maybeSingle()
     // Never let the bot chat with the advisor who receives the alerts.
     if (isAdvisorPhone(contact?.phone)) return
+
+    // A customer coming back after a long silence starts over: bot
+    // active again, counter at zero, no open handoff. A bot-made
+    // assignment (to the handoff agent) is released too.
+    if (
+      (conv.ai_autoreply_disabled ||
+        conv.ai_handoff_summary ||
+        conv.ai_handoff_stage ||
+        (conv.ai_reply_count ?? 0) > 0) &&
+      (await isNewConversation(db, conversationId))
+    ) {
+      const reset: Record<string, unknown> = {
+        ai_autoreply_disabled: false,
+        ai_handoff_summary: null,
+        ai_handoff_stage: null,
+        ai_handoff_free_replies: 0,
+        ai_reply_count: 0,
+      }
+      if (
+        config.handoffAgentId &&
+        conv.assigned_agent_id === config.handoffAgentId
+      ) {
+        reset.assigned_agent_id = null
+      }
+      await db.from('conversations').update(reset).eq('id', conversationId)
+      Object.assign(conv, reset)
+    }
+
+    if (conv.ai_autoreply_disabled) return // agent replied / turned off here
+
+    const send = (text: string) =>
+      engineSendText({
+        accountId,
+        userId: configOwnerUserId,
+        conversationId,
+        contactId,
+        text,
+        aiGenerated: true,
+      })
+    const setConv = async (patch: Record<string, unknown>) => {
+      await db.from('conversations').update(patch).eq('id', conversationId)
+    }
+    const showMenu = async (bodyText: string) => {
+      await engineSendInteractiveButtons({
+        accountId,
+        userId: configOwnerUserId,
+        conversationId,
+        contactId,
+        bodyText,
+        buttons: HANDOFF_BUTTONS,
+      })
+      await setConv({ ai_handoff_stage: 'menu', ai_handoff_free_replies: 0 })
+    }
+
+    // ── Button taps: fixed replies, no LLM ──────────────────────────
+    if (handoffChoice) {
+      if (handoffChoice === 'new') {
+        // Back to a normal conversation. The summary stays: the advisor
+        // still owes an answer to the earlier question.
+        await setConv({
+          ai_handoff_stage: null,
+          ai_handoff_free_replies: 0,
+          ai_reply_count: 0,
+        })
+      } else {
+        await setConv({
+          ai_handoff_stage: handoffChoice === 'wait' ? 'waiting' : 'quote',
+        })
+      }
+      await send(CHOICE_REPLIES[handoffChoice])
+      return
+    }
+
+    const stage = (conv.ai_handoff_stage ?? null) as HandoffStage
+    if (stage === 'waiting') return // customer chose to wait for the advisor
+    // A human owns the thread — unless it's the bot's own soft handoff.
+    if (conv.assigned_agent_id && !conv.ai_handoff_summary) return
+    // Cheap early-out; the authoritative cap check is the atomic claim
+    // below (this read can race a concurrent inbound).
+    if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
+
+    // Menu open and the customer keeps typing instead of tapping: after
+    // a couple of replies, put the buttons in front of them again.
+    if (
+      stage === 'menu' &&
+      (conv.ai_handoff_free_replies ?? 0) >= MENU_FREE_REPLY_LIMIT
+    ) {
+      await showMenu(pickRandom(DEFAULT_REMINDER_MESSAGES))
+      return
+    }
 
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
@@ -140,8 +247,7 @@ export async function dispatchInboundToAiReply(
     // Every gate has passed — we're committed to attempting a reply, so
     // show the customer "typing…" (and mark their message read) while the
     // retrieval + LLM round trips run. Meta clears the indicator after
-    // 25 s or when our reply lands, whichever is first, so there's
-    // nothing to undo on the handoff / no-text path. Strictly
+    // 25 s or when our reply lands, whichever is first. Strictly
     // best-effort: a failed indicator must never cost us the reply.
     if (inboundMessageId) {
       await showTypingIndicator(db, accountId, inboundMessageId)
@@ -158,7 +264,8 @@ export async function dispatchInboundToAiReply(
       mode: 'auto_reply',
       knowledge,
       inventory,
-      advisorNotified: softPending,
+      advisorNotified: !!conv.ai_handoff_summary,
+      quoteMode: stage === 'quote',
     })
 
     const { text, handoff, usage } = await generateReply({
@@ -170,8 +277,6 @@ export async function dispatchInboundToAiReply(
     // Record token spend on the account's BYO key. Fire-and-forget so it
     // never adds latency to the customer-facing send: `logAiUsage`
     // swallows its own errors, so the floating promise can't reject.
-    // Logged regardless of handoff — the provider call happened either
-    // way.
     void logAiUsage(db, {
       accountId,
       conversationId,
@@ -181,29 +286,39 @@ export async function dispatchInboundToAiReply(
       usage,
     })
 
-    if (handoff || !text) {
-      // The model can't (or shouldn't) answer. Soft handoff: instead of
-      // going silent, tell the customer an advisor replies in ~20 min,
-      // alert the advisor on WhatsApp, and keep the bot active on this
-      // thread until a human actually replies from the inbox.
-      if (
-        inboundMessageId &&
-        (await hasNewerInbound(db, conversationId, inboundMessageId))
-      ) {
-        return
-      }
+    if (
+      inboundMessageId &&
+      (await hasNewerInbound(db, conversationId, inboundMessageId))
+    ) {
+      return
+    }
 
-      if (softPending) {
-        // Advisor already alerted — a short nudge, no second alert.
-        if (!(await claimSlot(db, conversationId, config))) return
-        await engineSendText({
-          accountId,
-          userId: configOwnerUserId,
-          conversationId,
-          contactId,
-          text: pickRandom(DEFAULT_REMINDER_MESSAGES),
-          aiGenerated: true,
-        })
+    const customerLabel =
+      [
+        contact?.name,
+        contact?.phone ? `+${String(contact.phone).replace(/\D/g, '')}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ') || 'Cliente'
+
+    // ── Quote complete: hand the summary to the advisor ─────────────
+    if (stage === 'quote' && text.includes(QUOTE_SENTINEL)) {
+      const summary = text.split(QUOTE_SENTINEL).join(' ').trim()
+      await setConv({ ai_handoff_stage: 'waiting' })
+      await send(QUOTE_SENT_REPLY)
+      await alertAdvisor(db, accountId, {
+        customerLabel,
+        lastMessage: summary || lastCustomerText(messages),
+        kind: 'quote',
+      })
+      return
+    }
+
+    // ── The model can't answer → soft handoff ───────────────────────
+    if (handoff || !text) {
+      if (stage === 'menu' || stage === 'quote') {
+        // Advisor already alerted — just show the options again.
+        await showMenu(pickRandom(DEFAULT_REMINDER_MESSAGES))
         return
       }
 
@@ -211,12 +326,9 @@ export async function dispatchInboundToAiReply(
         messages,
         replyCount: conv.ai_reply_count ?? 0,
       })
-      // ai_autoreply_disabled stays false: the summary marks the soft
-      // handoff (banner + dashboard) while the bot keeps chatting.
-      await db
-        .from('conversations')
-        .update({ ai_handoff_summary: summary })
-        .eq('id', conversationId)
+      // ai_autoreply_disabled stays false: the summary marks the open
+      // handoff (inbox banner + dashboard) while the bot stays available.
+      await setConv({ ai_handoff_summary: summary })
       // Only set the assignee when a target is configured AND the thread
       // isn't already owned — never stomp an existing human assignment.
       // Assigning fires `on_conversation_assigned`, notifying the agent.
@@ -227,60 +339,73 @@ export async function dispatchInboundToAiReply(
           .eq('id', conversationId)
           .is('assigned_agent_id', null)
       }
-
-      // The courtesy message is sent even at the reply cap's edge — the
-      // customer must never be left without an answer.
-      await engineSendText({
-        accountId,
-        userId: configOwnerUserId,
-        conversationId,
-        contactId,
-        text: pickRandom(handoffMessages()),
-        aiGenerated: true,
+      // Sent even at the reply cap's edge — the customer must never be
+      // left without an answer.
+      await showMenu(pickRandom(handoffMessages()))
+      await alertAdvisor(db, accountId, {
+        customerLabel,
+        lastMessage: lastCustomerText(messages),
+        kind: 'handoff',
       })
-
-      try {
-        const { phoneNumberId, accessToken } = await loadAccountMetaCredentials(
-          db,
-          accountId,
-        )
-        const lastCustomer = [...messages]
-          .reverse()
-          .find((m) => m.role === 'user' && m.content.trim())
-        await notifyAdvisor({
-          phoneNumberId,
-          accessToken,
-          customerLabel: [contact?.name, contact?.phone ? `+${contact.phone.replace(/\D/g, '')}` : null]
-            .filter(Boolean)
-            .join(' · ') || 'Cliente',
-          lastMessage: lastCustomer?.content ?? '',
-        })
-      } catch (err) {
-        console.warn('[ai auto-reply] advisor alert skipped:', err)
-      }
-      return
-    }
-
-    if (
-      inboundMessageId &&
-      (await hasNewerInbound(db, conversationId, inboundMessageId))
-    ) {
       return
     }
 
     if (!(await claimSlot(db, conversationId, config))) return
 
-    await engineSendText({
-      accountId,
-      userId: configOwnerUserId,
-      conversationId,
-      contactId,
-      text,
-      aiGenerated: true,
-    })
+    await send(text)
+
+    if (stage === 'menu') {
+      await setConv({
+        ai_handoff_free_replies: (conv.ai_handoff_free_replies ?? 0) + 1,
+      })
+    }
   } catch (err) {
     console.error('[ai auto-reply] dispatch failed:', err)
   }
+}
+
+function lastCustomerText(messages: ChatMessage[]): string {
+  return (
+    [...messages].reverse().find((m) => m.role === 'user' && m.content.trim())
+      ?.content ?? ''
+  )
+}
+
+async function alertAdvisor(
+  db: ReturnType<typeof supabaseAdmin>,
+  accountId: string,
+  alert: { customerLabel: string; lastMessage: string; kind: 'handoff' | 'quote' },
+): Promise<void> {
+  try {
+    const { phoneNumberId, accessToken } = await loadAccountMetaCredentials(
+      db,
+      accountId,
+    )
+    await notifyAdvisor({ phoneNumberId, accessToken, ...alert })
+  } catch (err) {
+    console.warn('[ai auto-reply] advisor alert skipped:', err)
+  }
+}
+
+/**
+ * True when the customer's previous message (before the one that just
+ * arrived) is older than NEW_CONVERSATION_GAP_MS.
+ */
+async function isNewConversation(
+  db: ReturnType<typeof supabaseAdmin>,
+  conversationId: string,
+): Promise<boolean> {
+  const { data, error } = await db
+    .from('messages')
+    .select('message_id, created_at')
+    .eq('conversation_id', conversationId)
+    .eq('sender_type', 'customer')
+    .order('created_at', { ascending: false })
+    .limit(2)
+  if (error || !data || data.length < 2) return false
+  const previous = Date.parse(String(data[1].created_at ?? ''))
+  if (!Number.isFinite(previous)) return false
+  return Date.now() - previous > NEW_CONVERSATION_GAP_MS
 }
 
 /**

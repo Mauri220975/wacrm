@@ -84,6 +84,8 @@ export async function POST(request: Request, { params }: Params) {
       // a human choosing to re-engage the assistant.
       update.ai_reply_count = 0
       update.ai_handoff_summary = null
+      update.ai_handoff_stage = null
+      update.ai_handoff_free_replies = 0
     }
 
     const { error: upErr } = await supabase

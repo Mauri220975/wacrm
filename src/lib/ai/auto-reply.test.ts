@@ -8,6 +8,7 @@ const h = vi.hoisted(() => ({
   retrieveKnowledge: vi.fn(),
   generateReply: vi.fn(),
   engineSendText: vi.fn(),
+  engineSendInteractiveButtons: vi.fn(),
   loadAccountMetaCredentials: vi.fn(),
   sendTypingIndicator: vi.fn(),
   sendTextMessage: vi.fn(),
@@ -20,7 +21,7 @@ const h = vi.hoisted(() => ({
     updatePayload: null as Record<string, unknown> | null,
     updates: [] as { payload: Record<string, unknown>; isNull: string[] }[],
     rpcCalls: [] as { name: string; args: unknown }[],
-    latestInbound: [] as { message_id: string }[],
+    latestInbound: [] as { message_id: string; created_at?: string }[],
   },
 }))
 
@@ -30,6 +31,7 @@ vi.mock('./knowledge', () => ({ retrieveKnowledge: h.retrieveKnowledge }))
 vi.mock('./generate', () => ({ generateReply: h.generateReply }))
 vi.mock('@/lib/flows/meta-send', () => ({
   engineSendText: h.engineSendText,
+  engineSendInteractiveButtons: h.engineSendInteractiveButtons,
   loadAccountMetaCredentials: h.loadAccountMetaCredentials,
 }))
 vi.mock('@/lib/whatsapp/meta-api', () => ({
@@ -150,6 +152,7 @@ beforeEach(() => {
   h.retrieveKnowledge.mockResolvedValue([])
   h.generateReply.mockResolvedValue({ text: 'Hello!', handoff: false })
   h.engineSendText.mockResolvedValue({ whatsapp_message_id: 'm1' })
+  h.engineSendInteractiveButtons.mockResolvedValue({ whatsapp_message_id: 'b1' })
   h.loadAccountMetaCredentials.mockResolvedValue({
     phoneNumberId: 'pn-1',
     accessToken: 'tok',
@@ -333,28 +336,36 @@ describe('dispatchInboundToAiReply — typing indicator (#527)', () => {
   })
 })
 
-describe('dispatchInboundToAiReply — soft handoff', () => {
-  it('writes a summary, keeps the bot active, and sends a courtesy message', async () => {
+describe('dispatchInboundToAiReply — soft handoff with buttons', () => {
+  const HANDED_OFF = '🤖 AI agent handed off'
+  const menuButtons = () =>
+    h.engineSendInteractiveButtons.mock.calls[0][0].buttons.map(
+      (b: { id: string }) => b.id,
+    )
+
+  it('first handoff: writes a summary, shows the 3 buttons, keeps the bot active', async () => {
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).toHaveBeenCalledTimes(1)
-    expect(h.engineSendText.mock.calls[0][0].text).toMatch(/asesor/)
-    expect(h.engineSendText.mock.calls[0][0].aiGenerated).toBe(true)
+    expect(h.engineSendText).not.toHaveBeenCalled()
+    expect(h.engineSendInteractiveButtons).toHaveBeenCalledTimes(1)
+    expect(h.engineSendInteractiveButtons.mock.calls[0][0].bodyText).toMatch(/asesor/)
+    expect(menuButtons()).toEqual(['ai_ho:new', 'ai_ho:wait', 'ai_ho:quote'])
     expect(h.state.updatePayload).not.toHaveProperty('ai_autoreply_disabled')
-    expect(h.state.updatePayload?.ai_handoff_summary).toContain(
-      'AI agent handed off',
-    )
+    expect(h.state.updatePayload?.ai_handoff_summary).toContain(HANDED_OFF)
+    expect(h.state.updatePayload).toMatchObject({ ai_handoff_stage: 'menu' })
     // No handoff target configured → conversation left unassigned.
     expect(h.state.updatePayload).not.toHaveProperty('assigned_agent_id')
     // No advisor phone configured → no alert.
     expect(h.sendTextMessage).not.toHaveBeenCalled()
   })
 
-  it('uses the configured courtesy messages', async () => {
+  it('uses the configured courtesy messages as the menu body', async () => {
     process.env.AI_HANDOFF_MESSAGES = 'Uno || Dos'
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    expect(['Uno', 'Dos']).toContain(h.engineSendText.mock.calls[0][0].text)
+    expect(['Uno', 'Dos']).toContain(
+      h.engineSendInteractiveButtons.mock.calls[0][0].bodyText,
+    )
   })
 
   it('alerts the advisor on WhatsApp (text, or template when configured)', async () => {
@@ -366,7 +377,6 @@ describe('dispatchInboundToAiReply — soft handoff', () => {
     expect(h.sendTextMessage.mock.calls[0][0].text).toContain('Ana · +51999888777')
 
     process.env.AI_HANDOFF_NOTIFY_TEMPLATE = 'aviso_asesor'
-    h.state.conv = { ...h.state.conv, ai_handoff_summary: null }
     await dispatchInboundToAiReply(ARGS)
     expect(h.sendTemplateMessage).toHaveBeenCalledTimes(1)
     expect(h.sendTemplateMessage.mock.calls[0][0]).toMatchObject({
@@ -385,32 +395,159 @@ describe('dispatchInboundToAiReply — soft handoff', () => {
     expect(assign?.isNull).toEqual(['assigned_agent_id'])
   })
 
-  it('keeps replying while the handoff is pending, even if assigned', async () => {
+  it('menu open: answers typed text and counts it', async () => {
     h.state.conv = {
+      ...h.state.conv,
       assigned_agent_id: 'agent-7',
-      ai_autoreply_disabled: false,
-      ai_reply_count: 1,
-      ai_handoff_summary: '🤖 AI agent handed off',
+      ai_handoff_summary: HANDED_OFF,
+      ai_handoff_stage: 'menu',
+      ai_handoff_free_replies: 0,
     }
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).toHaveBeenCalledTimes(1)
     expect(h.engineSendText.mock.calls[0][0].text).toBe('Hello!')
+    expect(h.state.updatePayload).toMatchObject({ ai_handoff_free_replies: 1 })
   })
 
-  it('sends a short reminder (no second alert) on a repeat handoff', async () => {
+  it('menu open: shows the buttons again once the free replies are used', async () => {
+    h.state.conv = {
+      ...h.state.conv,
+      ai_handoff_summary: HANDED_OFF,
+      ai_handoff_stage: 'menu',
+      ai_handoff_free_replies: 2,
+    }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.generateReply).not.toHaveBeenCalled()
+    expect(h.engineSendInteractiveButtons).toHaveBeenCalledTimes(1)
+    expect(h.state.updatePayload).toMatchObject({
+      ai_handoff_stage: 'menu',
+      ai_handoff_free_replies: 0,
+    })
+  })
+
+  it('menu open: a repeat handoff re-shows the buttons without a second alert', async () => {
     process.env.AI_HANDOFF_NOTIFY_PHONE = '393756770291'
-    h.state.conv = { ...h.state.conv, ai_handoff_summary: '🤖 AI agent handed off' }
+    h.state.conv = {
+      ...h.state.conv,
+      ai_handoff_summary: HANDED_OFF,
+      ai_handoff_stage: 'menu',
+      ai_handoff_free_replies: 0,
+    }
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    expect(h.state.rpcCalls).toHaveLength(1)
-    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.engineSendInteractiveButtons).toHaveBeenCalledTimes(1)
     expect(h.sendTextMessage).not.toHaveBeenCalled()
+  })
+
+  it('"Nueva consulta" returns to a normal conversation with a fresh counter', async () => {
+    h.state.conv = {
+      ...h.state.conv,
+      ai_handoff_summary: HANDED_OFF,
+      ai_handoff_stage: 'menu',
+      ai_reply_count: 3,
+    }
+    await dispatchInboundToAiReply({ ...ARGS, handoffChoice: 'new' })
+    expect(h.generateReply).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toMatchObject({ ai_handoff_stage: null, ai_reply_count: 0 })
+    expect(h.engineSendText.mock.calls[0][0].text).toMatch(/ayudar/)
+  })
+
+  it('"Seguir esperando" keeps the bot quiet afterwards', async () => {
+    h.state.conv = { ...h.state.conv, ai_handoff_summary: HANDED_OFF, ai_handoff_stage: 'menu' }
+    await dispatchInboundToAiReply({ ...ARGS, handoffChoice: 'wait' })
+    expect(h.state.updatePayload).toMatchObject({ ai_handoff_stage: 'waiting' })
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+
+    h.engineSendText.mockClear()
+    h.state.conv = { ...h.state.conv, ai_handoff_stage: 'waiting' }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.generateReply).not.toHaveBeenCalled()
+    expect(h.engineSendText).not.toHaveBeenCalled()
+  })
+
+  it('"Pedir cotización" collects details and sends the advisor a summary', async () => {
+    process.env.AI_HANDOFF_NOTIFY_PHONE = '393756770291'
+    h.state.conv = { ...h.state.conv, ai_handoff_summary: HANDED_OFF, ai_handoff_stage: 'menu' }
+    await dispatchInboundToAiReply({ ...ARGS, handoffChoice: 'quote' })
+    expect(h.state.updatePayload).toMatchObject({ ai_handoff_stage: 'quote' })
+    expect(h.engineSendText.mock.calls[0][0].text).toMatch(/kilos/)
+
+    // Still missing details → a normal collecting reply.
+    h.engineSendText.mockClear()
+    h.state.conv = { ...h.state.conv, ai_handoff_stage: 'quote' }
+    h.generateReply.mockResolvedValue({ text: '¿Qué color?', handoff: false })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText.mock.calls[0][0].text).toBe('¿Qué color?')
+    expect(h.sendTextMessage).not.toHaveBeenCalled()
+
+    // All details in → confirmation + advisor alert, then wait.
+    h.engineSendText.mockClear()
+    h.generateReply.mockResolvedValue({
+      text: '[[QUOTE]] Jersey 30/1 · Rojo · 25 kg · Miraflores',
+      handoff: false,
+    })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText.mock.calls[0][0].text).toMatch(/cotización/)
+    expect(h.engineSendText.mock.calls[0][0].text).not.toContain('[[QUOTE]]')
+    expect(h.state.updatePayload).toMatchObject({ ai_handoff_stage: 'waiting' })
+    expect(h.sendTextMessage).toHaveBeenCalledTimes(1)
+    expect(h.sendTextMessage.mock.calls[0][0].text).toContain(
+      'Jersey 30/1 · Rojo · 25 kg · Miraflores',
+    )
+  })
+
+  it('a tap is ignored once a human replied', async () => {
+    h.state.conv = { ...h.state.conv, ai_autoreply_disabled: true, ai_handoff_summary: HANDED_OFF }
+    await dispatchInboundToAiReply({ ...ARGS, handoffChoice: 'new' })
+    expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
   it('stops once a human replied (ai_autoreply_disabled)', async () => {
     h.state.conv = { ...h.state.conv, ai_autoreply_disabled: true, ai_handoff_summary: 'x' }
     await dispatchInboundToAiReply(ARGS)
     expect(h.generateReply).not.toHaveBeenCalled()
+    expect(h.engineSendText).not.toHaveBeenCalled()
+  })
+
+  it('starts over when the customer writes after more than 24 h', async () => {
+    h.loadAiConfig.mockResolvedValue(aiConfig({ handoffAgentId: 'agent-7' }))
+    h.state.conv = {
+      assigned_agent_id: 'agent-7',
+      ai_autoreply_disabled: true,
+      ai_reply_count: 3,
+      ai_handoff_summary: HANDED_OFF,
+      ai_handoff_stage: 'waiting',
+      ai_handoff_free_replies: 0,
+    }
+    h.state.latestInbound = [
+      { message_id: 'wamid.inbound-1', created_at: new Date().toISOString() },
+      {
+        message_id: 'wamid.old',
+        created_at: new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString(),
+      },
+    ]
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.updates[0].payload).toMatchObject({
+      ai_autoreply_disabled: false,
+      ai_handoff_summary: null,
+      ai_handoff_stage: null,
+      ai_reply_count: 0,
+      assigned_agent_id: null,
+    })
+    expect(h.engineSendText.mock.calls[0][0].text).toBe('Hello!')
+  })
+
+  it('does not reset within 24 h', async () => {
+    h.state.conv = { ...h.state.conv, ai_autoreply_disabled: true }
+    h.state.latestInbound = [
+      { message_id: 'wamid.inbound-1', created_at: new Date().toISOString() },
+      {
+        message_id: 'wamid.prev',
+        created_at: new Date(Date.now() - 3600 * 1000).toISOString(),
+      },
+    ]
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.updates).toHaveLength(0)
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
